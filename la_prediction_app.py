@@ -227,12 +227,13 @@ with col2:
         "Mandibular Molars"
     ])
     preop_med = st.selectbox("Pre-operative Medication", ["No", "Yes"])
-    pain_intensity = st.selectbox("Pain Intensity", ["Mild", "Moderate", "Severe"],
-                                  index=1)
+    if hp_vas > 114:   pain_intensity = "Severe"
+    elif hp_vas > 54:  pain_intensity = "Moderate"
+    else:              pain_intensity = "Mild"
     if age <= 35:   age_group = "18-35"
     elif age <= 55: age_group = "36-55"
     else:           age_group = "56-70"
-    st.info(f"Age Group (auto): **{age_group}**")
+    st.info(f"Age Group (auto): **{age_group}**  |  Pain Intensity (auto): **{pain_intensity}**")
 
 # ─────────────────────────────────────────────
 # PREDICTION
