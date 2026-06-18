@@ -84,7 +84,7 @@ with st.sidebar:
     uploaded_file = st.file_uploader(
         "LA_Endodontic_Dataset_4390.xlsx",
         type=["xlsx"],
-        help="Must contain columns: Age, HP_VAS_Score, Gender, Alcohol_Use, Tooth_Type, Preop_Medication, Pain_Intensity, Age_Group, Anesthesia_Success"
+        help="Must contain columns: Age, Gender, Alcohol_Use, Tooth_Type, Preop_Medication, Pain_Intensity, HP_VAS_Score, Anesthesia_Success (HP_VAS_Score and Age_Group are not used directly by the model; Age_Group, if present, is ignored)"
     )
 
     st.markdown("---")
@@ -96,12 +96,18 @@ Alcohol_Use
 Tooth_Type
 Preop_Medication
 Pain_Intensity
-Age_Group
 Anesthesia_Success""", language=None)
+    st.caption(
+        "HP_VAS_Score is used only to derive Pain_Intensity (Mild/Moderate/Severe) "
+        "and is not entered into the model separately, since the two are collinear "
+        "(Pain_Intensity is a categorical re-binning of HP_VAS_Score). Age_Group is "
+        "not used as a model feature; Age enters the model as a continuous variable."
+    )
 
     st.markdown("---")
-    st.markdown("**Model:** Logistic Regression")
-    st.markdown("**Split:** 70/15/15 stratified")
+    st.markdown("**Model:** Logistic Regression (L2, C = 100, class-weight balanced)")
+    st.markdown("**Split:** 70/30 stratified train/test")
+    st.markdown("**Reference categories:** Mandibular Molars · Female · No alcohol · No preop. medication · Mild pain")
     st.markdown("**Developer:** Prof. Vivek Aggarwal")
 
 # ─────────────────────────────────────────────
@@ -153,38 +159,86 @@ def generate_synthetic_data():
 
 # ─────────────────────────────────────────────
 # MODEL TRAINING
+# Mirrors the published manuscript model exactly:
+#   - Predictors: Age, Gender, Alcohol_Use, Tooth_Type, Preop_Medication, Pain_Intensity
+#   - HP_VAS_Score is NOT used as a separate predictor: it is collinear with
+#     Pain_Intensity (Pain_Intensity is a categorical re-binning of HP_VAS_Score:
+#     Mild = 1-54, Moderate = 55-114, Severe = 115-170), so including both would
+#     introduce multicollinearity and distort coefficient estimates.
+#   - Reference-coded dummy variables (NOT drop_first one-hot encoding):
+#       Tooth_Type reference = Mandibular Molars (lowest success rate)
+#       Gender reference = Female
+#       Alcohol_Use reference = No
+#       Preop_Medication reference = No
+#       Pain_Intensity reference = Mild
+#   - 70/30 stratified train/test split (no separate validation split)
+#   - Logistic regression: L2 penalty, C = 100, class_weight = 'balanced'
+#   - Age is standardized; dummy-coded predictors are not
 # ─────────────────────────────────────────────
+
+REFERENCE_TOOTH_TYPE = "Mandibular Molars"
+ALL_TOOTH_TYPES = [
+    "Maxillary Incisors/Canine",
+    "Mandibular Premolars",
+    "Maxillary Premolars",
+    "Maxillary Molars",
+    "Mandibular Anteriors",
+    "Mandibular Molars"
+]
+NON_REFERENCE_TOOTH_TYPES = sorted([t for t in ALL_TOOTH_TYPES if t != REFERENCE_TOOTH_TYPE])
+NON_REFERENCE_PAIN_LEVELS = ["Moderate", "Severe"]  # Mild = reference
+
+FEATURE_COLUMNS = (
+    ["Age", "Gender_Male", "Alcohol_Use_Yes", "Preop_Medication_Yes"]
+    + [f"Tooth_Type_{t}" for t in NON_REFERENCE_TOOTH_TYPES]
+    + [f"Pain_Intensity_{p}" for p in NON_REFERENCE_PAIN_LEVELS]
+)
+
+def build_feature_matrix(df):
+    """Build the exact 11-column reference-coded feature matrix used in the manuscript model."""
+    X = pd.DataFrame()
+    X["Age"] = df["Age"].astype(float)
+    X["Gender_Male"] = (df["Gender"] == "Male").astype(int)
+    X["Alcohol_Use_Yes"] = (df["Alcohol_Use"] == "Yes").astype(int)
+    X["Preop_Medication_Yes"] = (df["Preop_Medication"] == "Yes").astype(int)
+    for t in NON_REFERENCE_TOOTH_TYPES:
+        X[f"Tooth_Type_{t}"] = (df["Tooth_Type"] == t).astype(int)
+    for p in NON_REFERENCE_PAIN_LEVELS:
+        X[f"Pain_Intensity_{p}"] = (df["Pain_Intensity"] == p).astype(int)
+    return X[FEATURE_COLUMNS]
+
 @st.cache_resource
 def train_model(data_key):
     """Train logistic regression. data_key changes when new file uploaded."""
     return _train(data_key)
 
 def _train(df):
-    feature_cols = ["Age", "HP_VAS_Score", "Gender", "Alcohol_Use",
-                    "Tooth_Type", "Preop_Medication", "Pain_Intensity", "Age_Group"]
+    X = build_feature_matrix(df)
+    y = df["Anesthesia_Success"].astype(int)
 
-    df_enc = pd.get_dummies(df[feature_cols + ["Anesthesia_Success"]],
-                            columns=["Gender", "Alcohol_Use", "Tooth_Type",
-                                     "Preop_Medication", "Pain_Intensity", "Age_Group"])
+    # 70/30 stratified split, matching manuscript Methods 2.7 (no separate validation split)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.30, stratify=y, random_state=42
+    )
 
-    X = df_enc.drop("Anesthesia_Success", axis=1)
-    y = df_enc["Anesthesia_Success"]
-
-    X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.30,
-                                                         stratify=y, random_state=42)
-    X_val, X_test, y_val, y_test     = train_test_split(X_temp, y_temp, test_size=0.50,
-                                                         stratify=y_temp, random_state=42)
-
+    # Standardize Age only; dummy-coded predictors are left unscaled (matches manuscript pipeline)
     scaler = StandardScaler()
-    X_train_s = scaler.fit_transform(X_train)
-    X_test_s  = scaler.transform(X_test)
+    X_train_s = X_train.copy()
+    X_test_s = X_test.copy()
+    X_train_s["Age"] = scaler.fit_transform(X_train[["Age"]])
+    X_test_s["Age"] = scaler.transform(X_test[["Age"]])
 
-    model = LogisticRegression(max_iter=1000, random_state=42, class_weight="balanced")
+    # C=100 and class_weight='balanced' match the cross-validated hyperparameters
+    # selected for the published model (Methods 2.7 / Table 2)
+    model = LogisticRegression(
+        penalty="l2", C=100, class_weight="balanced", max_iter=1000, random_state=42
+    )
     model.fit(X_train_s, y_train)
 
     auc = roc_auc_score(y_test, model.predict_proba(X_test_s)[:, 1])
 
-    return model, scaler, list(X.columns), round(auc, 3)
+    return model, scaler, FEATURE_COLUMNS, round(auc, 3)
+
 
 # ─────────────────────────────────────────────
 # LOAD DATA & TRAIN
@@ -239,17 +293,17 @@ with col2:
 # PREDICTION
 # ─────────────────────────────────────────────
 def predict(age, hp_vas, gender, alcohol, tooth_type, preop_med, pain_intensity, age_group):
-    patient = {
-        "Age": age, "HP_VAS_Score": hp_vas,
-        f"Gender_{gender}": 1,
-        f"Alcohol_Use_{alcohol}": 1,
-        f"Tooth_Type_{tooth_type}": 1,
-        f"Preop_Medication_{preop_med}": 1,
-        f"Pain_Intensity_{pain_intensity}": 1,
-        f"Age_Group_{age_group}": 1
-    }
-    row = pd.DataFrame([{col: patient.get(col, 0) for col in feature_cols}])
-    row_s = scaler.transform(row)
+    patient_df = pd.DataFrame([{
+        "Age": age,
+        "Gender": gender,
+        "Alcohol_Use": alcohol,
+        "Tooth_Type": tooth_type,
+        "Preop_Medication": preop_med,
+        "Pain_Intensity": pain_intensity
+    }])
+    row = build_feature_matrix(patient_df)
+    row_s = row.copy()
+    row_s["Age"] = scaler.transform(row[["Age"]])
     prob = model.predict_proba(row_s)[0][1]
     return prob
 
